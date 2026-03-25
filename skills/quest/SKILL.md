@@ -159,20 +159,25 @@ ${CLAUDE_PLUGIN_ROOT}/bin/check-ast $TEST_FILE --check symbol-used test_greet_la
 
 This verifies a test function `test_greet_language` exists AND is referenced (not dead code). Do this for each test case you expect.
 
-### Metagates — for complex or hard-to-verify work
+### Metagates — test verification, IN ADDITION to implementation gates
 
-Some changes are too complex to verify structurally (deep algorithmic changes, multi-file refactors with emergent behavior, protocol implementations). For these, add **metagates** — gates that verify the verification:
+Metagates verify tests exist and are well-structured. They are ALWAYS added alongside exhaustive implementation gates, never instead of them.
 
-- **Test file exists**: raw query on the test file to check it was created
+All code is AST. There is no implementation "too complex" to gate structurally. A multi-file refactor is just N files with N sets of AST checks. An algorithm change is function signatures, call sites, assignments, and control flow — all queryable. Do not skip implementation gates because something feels complicated. Break it down, gate each piece.
+
+Metagates add a second layer on top:
+
+- **Test file exists**: raw query on the test file for test function definitions
 - **Test covers the change**: `--check symbol-used` on expected test function names
-- **Test assertions present**: raw query for assertion nodes (`(call_expression function: (identifier) @fn (#match? @fn "assert|expect|should"))`)
-- **Minimum test count**: raw query with `--min N` for the number of test functions
+- **Test assertions present**: raw query for assertion nodes
+- **Minimum test count**: raw query with `--min N`
+- **Success and failure paths**: compound query for both happy and error test cases
 
-Example metagate set for a complex feature:
+Example metagate set:
 
 ```json
 {
-  "name": "test file created for auth middleware",
+  "name": "test file has 3+ test functions",
   "check": "${CLAUDE_PLUGIN_ROOT}/bin/check-ast /path/test_auth.py '(function_definition name: (identifier) @fn (#match? @fn \"test_\"))' --min 3"
 },
 {
@@ -180,12 +185,12 @@ Example metagate set for a complex feature:
   "check": "${CLAUDE_PLUGIN_ROOT}/bin/check-ast /path/test_auth.py '(call function: (attribute object: (_) attribute: (identifier) @m) (#match? @m \"assert|assertEqual|assertTrue\"))' --min 3"
 },
 {
-  "name": "tests cover both success and failure paths",
+  "name": "tests cover success and failure paths",
   "check": "${CLAUDE_PLUGIN_ROOT}/bin/check-ast /path/test_auth.py --all '(function_definition name: (identifier) @fn (#match? @fn \"test_.*success|test_.*valid\"))' --min 1 -- '(function_definition name: (identifier) @fn (#match? @fn \"test_.*fail|test_.*invalid|test_.*error\"))' --min 1"
 }
 ```
 
-The principle: if you can't gate the implementation directly, gate the tests that verify the implementation. Tests are code — they have AST structure — they can be gated.
+These metagates sit next to the implementation gates, not in place of them. A quest should have BOTH.
 
 ## Subcommands
 
