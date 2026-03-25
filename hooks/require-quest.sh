@@ -7,7 +7,8 @@ INPUT=$(cat)
 FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // empty' 2>/dev/null)
 
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
-QUEST_DIR="$PROJECT_DIR/.claude/quests"
+_MAIN_TREE=$(git -C "$PROJECT_DIR" worktree list --porcelain 2>/dev/null | head -1 | sed 's/^worktree //')
+QUEST_DIR="${_MAIN_TREE:-$PROJECT_DIR}/.claude/quests"
 MARKER="$QUEST_DIR/.plan-pending"
 
 # No marker = no plan-based requirement

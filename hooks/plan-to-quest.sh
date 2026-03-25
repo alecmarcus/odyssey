@@ -4,7 +4,8 @@
 set -euo pipefail
 
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
-QUEST_DIR="$PROJECT_DIR/.claude/quests"
+_MAIN_TREE=$(git -C "$PROJECT_DIR" worktree list --porcelain 2>/dev/null | head -1 | sed 's/^worktree //')
+QUEST_DIR="${_MAIN_TREE:-$PROJECT_DIR}/.claude/quests"
 
 mkdir -p "$QUEST_DIR"
 touch "$QUEST_DIR/.plan-pending"

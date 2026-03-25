@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Stop hook: BLOCKS stop when active quest gates are failing.
+# SubagentStop hook: blocks subagent completion when quest gates are failing.
+# Only runs on subagent return — not on every response.
 
 set -euo pipefail
 
-PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
-QUEST_DIR="$PROJECT_DIR/.claude/quests"
+_PROJECT="${CLAUDE_PROJECT_DIR:-$PWD}"
+_MAIN_TREE=$(git -C "$_PROJECT" worktree list --porcelain 2>/dev/null | head -1 | sed 's/^worktree //')
+QUEST_DIR="${_MAIN_TREE:-.}/.claude/quests"
 
 if [ ! -d "$QUEST_DIR" ]; then
   exit 0
@@ -25,14 +27,14 @@ for quest_file in "${QUEST_FILES[@]}"; do
     GATE_NAME=$(echo "$gate" | jq -r '.name // "unnamed gate"')
     GATE_CHECK=$(echo "$gate" | jq -r '.check // "false"')
 
-    if ! (cd "$PROJECT_DIR" && timeout 30 bash -c "$GATE_CHECK") >/dev/null 2>&1; then
+    if ! (cd "$_PROJECT" && timeout 30 bash -c "$GATE_CHECK") >/dev/null 2>&1; then
       FAILURES="${FAILURES}  ✗ [${QUEST_NAME}] ${GATE_NAME}\n"
     fi
   done < <(jq -c '.gates[]' "$quest_file" 2>/dev/null)
 done
 
 if [ -n "$FAILURES" ]; then
-  REASON=$(printf 'BLOCKED: Quest gates are failing. You are not done.\n\nFailing gates:\n%bFix all failing gates before stopping.' "$FAILURES")
+  REASON=$(printf 'BLOCKED: Quest gates are failing. Subagent work is incomplete.\n\nFailing gates:\n%bFix all failing gates before returning.' "$FAILURES")
   REASON_JSON=$(echo "$REASON" | jq -Rs '.')
   echo "{\"decision\":\"block\",\"reason\":${REASON_JSON}}"
 fi
