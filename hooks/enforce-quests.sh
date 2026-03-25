@@ -51,5 +51,14 @@ if [ -n "$FAILURES" ]; then
   REASON_JSON=$(echo "$REASON" | jq -Rs '.')
   echo "{\"decision\":\"block\",\"reason\":${REASON_JSON}}"
 else
+  # All gates pass — auto-archive completed quests
+  if echo "$COMMAND" | grep -qE 'git\s+commit'; then
+    mkdir -p "$QUEST_DIR/done"
+    for quest_file in "${QUEST_FILES[@]}"; do
+      [ -f "$quest_file" ] || continue
+      mv "$quest_file" "$QUEST_DIR/done/"
+    done
+    rm -f "$QUEST_DIR/.plan-pending"
+  fi
   echo '{"decision":"allow"}'
 fi

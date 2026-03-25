@@ -6,21 +6,14 @@ user_invocable: true
 
 # Quests
 
-Quests are mechanically enforced task contracts. Each quest defines **gates** — shell commands that must exit 0. Hooks block `git commit`, `git push`, and `stop` until every active gate passes.
+Quests are mechanically enforced task contracts. Each quest defines **gates** — shell commands that must exit 0. Hooks block `git commit`, `git push`, and `stop` until every active gate passes. Quests auto-archive when all gates pass on commit.
 
 Quest files live at `.claude/quests/<name>.json` in the project directory.
 
 ## Subcommands
 
-Parse the user's argument to determine which subcommand to run:
-
 ### `/quest` or `/quest list`
-List all active quests and run their gates to show current status.
-
-For each quest file in `.claude/quests/*.json`:
-1. Read the quest
-2. Run each gate's `check` command (in the project directory, with `timeout 30`)
-3. Display:
+List active quests, run gates, show status:
 ```
 Quest: <name> — <description>
   ✓ gate name
@@ -29,142 +22,161 @@ Quest: <name> — <description>
 ```
 
 ### `/quest create`
-Create a new quest for the current task. Steps:
-
-1. Ask the user what the task is (or infer from recent conversation context)
-2. Parse intent into a structured pattern (see Gate Templates below)
-3. Generate gates mechanically from templates
-4. Present the quest to the user for approval
-5. On approval, write to `.claude/quests/<name>.json`
+1. Ask the user what the task is (or infer from context)
+2. Parse intent into a gate template (see below)
+3. Generate gates using tree-sitter queries via `check-ast`
+4. Present quest for user approval
+5. Write to `.claude/quests/<name>.json`
 
 ### `/quest check`
-Same as `list` but re-runs all gates and shows verbose output for failures (include stderr).
+Re-run all gates with verbose failure output.
 
 ### `/quest done <name>`
-1. Run all gates for the named quest
-2. If ALL pass: move to `.claude/quests/done/<name>.json`, report completion
-3. If ANY fail: refuse, show which failed
+Run all gates. If ALL pass, archive to `.claude/quests/done/`. Refuse if any fail.
 
 ### `/quest abandon <name>`
-Remove the quest file without verification. For when the task changes or gates are wrong.
+Delete the quest file. For when the task changes or gates are wrong.
 
-## Gate Templates
+## Gate Checker: `check-ast`
 
-Generate gates from these templates. Do NOT write gates from scratch — match the task to a template and fill in the blanks.
+All structural gates MUST use `check-ast` — the tree-sitter query wrapper bundled with odyssey. Located at `${CLAUDE_PLUGIN_ROOT}/bin/check-ast`.
 
-IMPORTANT: Use `grep -E` (extended regex), NOT `grep -P` (Perl regex). macOS BSD grep does not support `-P`.
+**NO GREP.** Grep matches text, not code. Comments and strings fool it. `check-ast` operates on the parsed AST — cheat-proof by construction.
 
-### ADD PARAM: Add parameter `$PARAM` to function `$FN` in `$FILE`, update call sites
+### Usage
 
-```json
-[
-  {
-    "name": "$FN() signature has $PARAM param",
-    "check": "grep -qE '(def|function|fn|pub fn) $FN\\(.*$PARAM' $FILE"
-  },
-  {
-    "name": "all call sites pass $PARAM",
-    "check": "test $(grep -E '$FN\\(' $FILE | grep -v '(def |function |fn |pub fn )' | grep -v '$PARAM' | wc -l | tr -d ' ') -eq 0"
-  },
-  {
-    "name": "expected number of call sites updated",
-    "check": "test $(grep -E '$FN\\(.*$PARAM' $FILE | grep -v '(def |function |fn |pub fn )' | wc -l | tr -d ' ') -ge $COUNT"
-  }
-]
+```bash
+check-ast <file> '<tree-sitter-query>' [--min N] [--max N] [--exact N] [--zero]
+check-ast <file> <query-file.scm> [--min N] [--max N] [--exact N] [--zero]
 ```
 
-### RENAME: Rename `$OLD` to `$NEW` across `$GLOB`
+Options:
+- `--min N` — at least N matches (default: 1)
+- `--max N` — at most N matches
+- `--exact N` — exactly N matches
+- `--zero` — no matches (shorthand for `--exact 0`)
 
-```json
-[
-  {
-    "name": "$OLD is gone from all source files",
-    "check": "test $(grep -rE '$OLD' $GLOB | wc -l | tr -d ' ') -eq 0"
-  },
-  {
-    "name": "$NEW exists in expected files",
-    "check": "grep -rqE '$NEW' $GLOB"
-  }
-]
+### Referencing check-ast in gates
+
+In quest gate `check` fields, use the full path to the bundled binary:
+
+```
+${CLAUDE_PLUGIN_ROOT}/bin/check-ast <file> '<query>' [options]
 ```
 
-### MOVE FILE: Move `$SRC` to `$DST`, update imports
+The hook runner expands `${CLAUDE_PLUGIN_ROOT}` automatically when running from a plugin context. For gates run via bash directly, use the resolved path.
 
-```json
-[
-  {
-    "name": "old file is gone",
-    "check": "test ! -f $SRC"
-  },
-  {
-    "name": "new file exists",
-    "check": "test -f $DST"
-  },
-  {
-    "name": "no imports reference old path",
-    "check": "test $(grep -rE '(import|require|from).*$OLD_MODULE' $GLOB | wc -l | tr -d ' ') -eq 0"
-  }
-]
+## Gate Templates — Tree-sitter Queries
+
+Match the task to a template. Fill in the blanks. To figure out the right query structure, run `tree-sitter parse <file>` first to see the AST node types for the target language.
+
+### JS/TS: Function has parameter
+
+```bash
+check-ast $FILE '(function_declaration
+  name: (identifier) @fn
+  parameters: (formal_parameters
+    (assignment_pattern left: (identifier) @p))
+  (#eq? @fn "$FN_NAME")
+  (#eq? @p "$PARAM_NAME"))'
 ```
 
-### ADD FILE: Create `$FILE` with required content
-
-```json
-[
-  {
-    "name": "file exists",
-    "check": "test -f $FILE"
-  },
-  {
-    "name": "file contains required pattern",
-    "check": "grep -qE '$PATTERN' $FILE"
-  }
-]
+For required (non-default) params:
+```bash
+check-ast $FILE '(function_declaration
+  name: (identifier) @fn
+  parameters: (formal_parameters (identifier) @p)
+  (#eq? @fn "$FN_NAME")
+  (#eq? @p "$PARAM_NAME"))'
 ```
 
-### DELETE: Remove `$PATTERN` from `$GLOB`
+### JS/TS: All calls have N+ arguments
 
-```json
-[
-  {
-    "name": "$PATTERN is gone",
-    "check": "test $(grep -rE '$PATTERN' $GLOB | wc -l | tr -d ' ') -eq 0"
-  }
-]
+```bash
+# Calls with 2 args (use N (_) nodes for N args)
+check-ast $FILE '(call_expression
+  function: (identifier) @fn
+  arguments: (arguments (_) (_))
+  (#eq? @fn "$FN_NAME"))' --min $CALL_COUNT
 ```
 
-### TESTS PASS
-
-```json
-[
-  {
-    "name": "test suite passes",
-    "check": "cd $PROJECT && $TEST_CMD"
-  }
-]
+To verify NO calls have fewer than N args, query for calls with <N args and use `--zero`:
+```bash
+# No 1-arg calls remain
+check-ast $FILE '(call_expression
+  function: (identifier) @fn
+  arguments: (arguments (_) .)
+  (#eq? @fn "$FN_NAME"))' --zero
 ```
 
-### CUSTOM: For anything not covered above
+### JS/TS: Function exists
 
-Write a gate using `grep -E`, `test`, or an inline script. Follow the rules below.
+```bash
+check-ast $FILE '(function_declaration
+  name: (identifier) @fn
+  (#eq? @fn "$FN_NAME"))'
+```
 
-## Gate Rules
+### JS/TS: No references to old name (rename complete)
 
-1. **Use templates first.** Only write custom gates when no template fits.
-2. **Check substance, not form.** Match the function/class/signature, not just a keyword.
-3. **Check both sides.** Verify the new thing exists AND the old thing is gone.
-4. **Count when counts matter.** If there are N call sites, verify N updates.
-5. **Use `grep -E`**, not `grep -P`. macOS compatibility.
-6. **Be specific about paths.** Don't glob the entire repo.
-7. **Always add a test gate** when the project has a test suite.
-8. **Inline scripts** for complex checks: `node -e "..."`, `python3 -c "..."`.
+```bash
+check-ast $FILE '((identifier) @id (#eq? @id "$OLD_NAME"))' --zero
+```
+
+### Python: Function has parameter
+
+```bash
+check-ast $FILE '(function_definition
+  name: (identifier) @fn
+  parameters: (parameters
+    (default_parameter name: (identifier) @p))
+  (#eq? @fn "$FN_NAME")
+  (#eq? @p "$PARAM_NAME"))'
+```
+
+### Python: All calls have N+ arguments
+
+```bash
+check-ast $FILE '(call
+  function: (identifier) @fn
+  arguments: (argument_list (keyword_argument name: (identifier) @kw))
+  (#eq? @fn "$FN_NAME")
+  (#eq? @kw "$PARAM_NAME"))' --min $CALL_COUNT
+```
+
+### Rust: Function has parameter
+
+```bash
+check-ast $FILE '(function_item
+  name: (identifier) @fn
+  parameters: (parameters (parameter pattern: (identifier) @p))
+  (#eq? @fn "$FN_NAME")
+  (#eq? @p "$PARAM_NAME"))'
+```
+
+### Any language: File runs without error
+
+```bash
+cd $PROJECT && $RUN_CMD
+```
+
+This is the one gate that doesn't need tree-sitter — runtime execution is its own verification.
+
+## Discovering Query Patterns
+
+When writing gates for a new language or unfamiliar AST structure:
+
+1. Run `tree-sitter parse <file>` to see the full S-expression AST
+2. Find the nodes you care about
+3. Write a query that matches that structure
+4. Test with `check-ast <file> '<query>'` before saving the quest
 
 ## Quest File Format
 
 ```json
 {
   "name": "descriptive-kebab-name",
-  "description": "One-line description of what this quest verifies",
+  "description": "One-line description",
   "created": "ISO-8601",
   "gates": [
     {
@@ -175,13 +187,10 @@ Write a gate using `grep -E`, `test`, or an inline script. Follow the rules belo
 }
 ```
 
-## Directory Structure
+## Lifecycle
 
-```
-.claude/quests/
-  active-quest.json
-  done/
-    completed-quest.json
-```
-
-Create directories as needed.
+1. Plan approved → `plan-to-quest` hook fires → marker set
+2. Quest gates defined → marker cleared → edits unblocked
+3. Work proceeds
+4. `git commit` → all gates verified → **auto-archived** to `.claude/quests/done/`
+5. Quest cleanup is automatic. No manual `/quest done` needed.

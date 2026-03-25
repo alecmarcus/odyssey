@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# AST gate checker using tree-sitter queries.
+# Cheat-proof: operates on parsed AST, not text. Comments/strings are invisible.
+#
+# Usage:
+#   check-ast <file> <query-file|inline-query> [options]
+#
+# Options:
+#   --min N      query must match at least N times (default: 1)
+#   --max N      query must match at most N times
+#   --exact N    query must match exactly N times
+#   --zero       query must match 0 times (shorthand for --exact 0)
+#
+# Examples:
+#   check-ast app.js query.scm --min 2
+#   check-ast app.js '(function_declaration name:(identifier) @fn (#eq? @fn "greet"))' --min 1
+#   check-ast app.js '(call_expression function:(identifier) @fn (#eq? @fn "oldName"))' --zero
+
+set -euo pipefail
+
+if [ $# -lt 2 ]; then
+  echo "Usage: check-ast <file> <query> [--min N] [--max N] [--exact N] [--zero]" >&2
+  exit 2
+fi
+
+FILE="$1"
+QUERY_INPUT="$2"
+shift 2
+
+MIN=""
+MAX=""
+EXACT=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --min)   MIN="$2"; shift 2 ;;
+    --max)   MAX="$2"; shift 2 ;;
+    --exact) EXACT="$2"; shift 2 ;;
+    --zero)  EXACT="0"; shift ;;
+    *) echo "Unknown option: $1" >&2; exit 2 ;;
+  esac
+done
+
+# Default: at least 1 match
+if [ -z "$MIN" ] && [ -z "$MAX" ] && [ -z "$EXACT" ]; then
+  MIN=1
+fi
+
+# If query is a file, use it. Otherwise write inline query to temp file.
+if [ -f "$QUERY_INPUT" ]; then
+  QUERY_FILE="$QUERY_INPUT"
+  CLEANUP=""
+else
+  QUERY_FILE=$(mktemp /tmp/odyssey-query-XXXXXX.scm)
+  echo "$QUERY_INPUT" > "$QUERY_FILE"
+  CLEANUP="$QUERY_FILE"
+fi
+
+# Run tree-sitter query, count pattern matches
+COUNT=$(tree-sitter query "$QUERY_FILE" "$FILE" 2>&1 | grep -c "^  pattern:" || true)
+
+# Cleanup temp file
+[ -n "${CLEANUP:-}" ] && rm -f "$CLEANUP"
+
+# Evaluate constraints
+PASS=true
+REASON=""
+
+if [ -n "$EXACT" ]; then
+  if [ "$COUNT" -ne "$EXACT" ]; then
+    PASS=false
+    REASON="expected exactly $EXACT match(es), got $COUNT"
+  fi
+fi
+
+if [ -n "$MIN" ]; then
+  if [ "$COUNT" -lt "$MIN" ]; then
+    PASS=false
+    REASON="expected at least $MIN match(es), got $COUNT"
+  fi
+fi
+
+if [ -n "$MAX" ]; then
+  if [ "$COUNT" -gt "$MAX" ]; then
+    PASS=false
+    REASON="expected at most $MAX match(es), got $COUNT"
+  fi
+fi
+
+if [ "$PASS" = true ]; then
+  exit 0
+else
+  echo "FAIL: $REASON" >&2
+  exit 1
+fi
