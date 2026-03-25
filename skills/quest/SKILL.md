@@ -154,14 +154,6 @@ check-ast $FILE '(function_item
   (#eq? @p "$PARAM_NAME"))'
 ```
 
-### Any language: File runs without error
-
-```bash
-cd $PROJECT && $RUN_CMD
-```
-
-This is the one gate that doesn't need tree-sitter — runtime execution is its own verification.
-
 ## Discovering Query Patterns
 
 When writing gates for a new language or unfamiliar AST structure:

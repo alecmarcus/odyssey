@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # PreToolUse on Write: validates quest files before they're written.
-# Every gate must use check-ast OR be a runtime test (test suite, interpreter).
-# No grep, no awk, no sed, no regex on text. No exceptions.
+# Every gate must use check-ast. Nothing else. No exceptions.
 
 set -euo pipefail
 
@@ -20,6 +19,13 @@ if echo "$FILE_PATH" | grep -q '\.claude/quests/done/'; then
   exit 0
 fi
 
+# Quest files are immutable once created. Can't edit, only abandon + recreate.
+# Prevents weakening gates and satisfying them in one shot.
+if [ -f "$FILE_PATH" ]; then
+  echo '{"decision":"block","reason":"BLOCKED: Quest files are immutable. You cannot edit an existing quest. To change gates, run /quest abandon <name> and create a new quest."}'
+  exit 0
+fi
+
 CONTENT=$(echo "$INPUT" | jq -r '.tool_input.content // empty' 2>/dev/null)
 
 if ! echo "$CONTENT" | jq -e '.gates' >/dev/null 2>&1; then
@@ -27,32 +33,19 @@ if ! echo "$CONTENT" | jq -e '.gates' >/dev/null 2>&1; then
   exit 0
 fi
 
-# Allowed runtime commands (test suites, interpreters — not structural checks)
-# These run the code, they don't inspect it textually.
-RUNTIME_PATTERN='(npm test|npx |yarn test|pnpm test|cargo test|cargo check|cargo build|pytest|python3? -[cm]|python3? .*\.py|node .*\.(js|mjs|ts)|go test|go build|swift test|swift build|make |cmake |tsc |eslint |mypy |ruff )'
-
 REJECTED=""
 while IFS= read -r gate; do
   GATE_NAME=$(echo "$gate" | jq -r '.name // "unnamed"')
   GATE_CHECK=$(echo "$gate" | jq -r '.check // ""')
 
-  # check-ast gates — always allowed
-  if echo "$GATE_CHECK" | grep -q 'check-ast'; then
-    continue
+  if ! echo "$GATE_CHECK" | grep -q 'check-ast'; then
+    REJECTED="${REJECTED}  ✗ \"${GATE_NAME}\": $(echo "$GATE_CHECK" | head -c 120)\n"
   fi
-
-  # Runtime/build/test commands — allowed
-  if echo "$GATE_CHECK" | grep -qE "$RUNTIME_PATTERN"; then
-    continue
-  fi
-
-  # Everything else is rejected
-  REJECTED="${REJECTED}  ✗ \"${GATE_NAME}\": $(echo "$GATE_CHECK" | head -c 120)\n"
 
 done < <(echo "$CONTENT" | jq -c '.gates[]' 2>/dev/null)
 
 if [ -n "$REJECTED" ]; then
-  REASON=$(printf 'BLOCKED: Every structural gate must use check-ast (tree-sitter). Only test/build commands are exempt.\n\nRejected gates:\n%b\nRewrite using: ${CLAUDE_PLUGIN_ROOT}/bin/check-ast <file> '\''<tree-sitter-query>'\'' [--min N|--zero]\nRun \"tree-sitter parse <file>\" first to see the AST node types.' "$REJECTED")
+  REASON=$(printf 'BLOCKED: Every gate must use check-ast (tree-sitter). No exceptions.\n\nRejected gates:\n%b\nRewrite using: ${CLAUDE_PLUGIN_ROOT}/bin/check-ast <file> '\''<tree-sitter-query>'\'' [--min N|--zero]\nRun \"tree-sitter parse <file>\" first to see the AST node types.' "$REJECTED")
   REASON_JSON=$(echo "$REASON" | jq -Rs '.')
   echo "{\"decision\":\"block\",\"reason\":${REASON_JSON}}"
 else

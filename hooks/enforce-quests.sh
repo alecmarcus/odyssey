@@ -7,6 +7,12 @@ set -euo pipefail
 INPUT=$(cat)
 COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)
 
+# Block deletion of quest files
+if echo "$COMMAND" | grep -qE '(rm|unlink)' && echo "$COMMAND" | grep -q '\.claude/quests'; then
+  echo '{"decision":"block","reason":"BLOCKED: Cannot delete quest files via shell. Use /quest abandon to remove a quest."}'
+  exit 0
+fi
+
 # Only gate on git commit and git push (anywhere in the command, catches chains)
 if ! echo "$COMMAND" | grep -qE 'git\s+(commit|push)'; then
   echo '{"decision":"allow"}'

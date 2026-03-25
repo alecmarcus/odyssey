@@ -1,7 +1,7 @@
 {
   "name": "odyssey",
   "description": "Mechanically enforced task gates. Quests define shell-command acceptance criteria that hooks verify — blocks git commit/push/stop until all gates pass.",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "author": {
     "name": "Alec Marcus",
     "url": "https://github.com/alecmarcus"
