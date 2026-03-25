@@ -6,164 +6,176 @@ user_invocable: true
 
 # Quests
 
-Quests are mechanically enforced task contracts. Each quest defines **gates** — shell commands that must exit 0. Hooks block `git commit`, `git push`, and `stop` until every active gate passes. Quests auto-archive when all gates pass on commit.
+Quests are mechanically enforced task contracts. Each quest defines **gates** that hooks verify. Hooks block `git commit`, `git push`, and `stop` until every gate passes. Quests auto-archive on commit. Quest files are immutable once created.
 
-Quest files live at `.claude/quests/<name>.json` in the project directory.
+## CRITICAL: How to write gates
 
-## Subcommands
+Every gate `check` field MUST be a call to `check-ast`. This is the ONLY allowed gate format:
 
-### `/quest` or `/quest list`
-List active quests, run gates, show status:
 ```
-Quest: <name> — <description>
-  ✓ gate name
-  ✗ gate name
-    check: <the failing command>
+${CLAUDE_PLUGIN_ROOT}/bin/check-ast <file> '<tree-sitter-query>' [--min N] [--max N] [--exact N] [--zero]
 ```
 
-### `/quest create`
-1. Ask the user what the task is (or infer from context)
-2. Parse intent into a gate template (see below)
-3. Generate gates using tree-sitter queries via `check-ast`
-4. Present quest for user approval
-5. Write to `.claude/quests/<name>.json`
+The harness will REJECT any gate that does not contain `check-ast`. The following are ALL FORBIDDEN and will be blocked:
+- `grep` — matches text, not code. A comment fools it.
+- `test` / `[` — shell conditionals on text output.
+- `awk` / `sed` / `rg` — text processing tools.
+- `node -e` / `python3 -c` — inline scripts.
+- `npm test` / `cargo test` / any test runner.
+- Anything that is not `check-ast`.
 
-### `/quest check`
-Re-run all gates with verbose failure output.
+There are ZERO exceptions. Do not try to work around this.
 
-### `/quest done <name>`
-Run all gates. If ALL pass, archive to `.claude/quests/done/`. Refuse if any fail.
+## How to write a check-ast gate
 
-### `/quest abandon <name>`
-Delete the quest file. For when the task changes or gates are wrong.
-
-## Gate Checker: `check-ast`
-
-All structural gates MUST use `check-ast` — the tree-sitter query wrapper bundled with odyssey. Located at `${CLAUDE_PLUGIN_ROOT}/bin/check-ast`.
-
-**NO GREP.** Grep matches text, not code. Comments and strings fool it. `check-ast` operates on the parsed AST — cheat-proof by construction.
-
-### Usage
+### Step 1: Run `tree-sitter parse` on the target file
 
 ```bash
-check-ast <file> '<tree-sitter-query>' [--min N] [--max N] [--exact N] [--zero]
-check-ast <file> <query-file.scm> [--min N] [--max N] [--exact N] [--zero]
+tree-sitter parse path/to/file.js
+```
+
+This outputs the AST as an S-expression. Read it. Find the node types for the code you need to verify.
+
+### Step 2: Write a tree-sitter query that matches the desired structure
+
+Tree-sitter queries use S-expression pattern syntax with `@captures` and `#eq?` predicates.
+
+### Step 3: Use check-ast with that query
+
+```
+${CLAUDE_PLUGIN_ROOT}/bin/check-ast path/to/file.js '(your_query_here)' --min 1
 ```
 
 Options:
 - `--min N` — at least N matches (default: 1)
 - `--max N` — at most N matches
 - `--exact N` — exactly N matches
-- `--zero` — no matches (shorthand for `--exact 0`)
+- `--zero` — no matches (same as `--exact 0`)
 
-### Referencing check-ast in gates
+### Step 4: Test the gate before saving the quest
 
-In quest gate `check` fields, use the full path to the bundled binary:
+Run the command. Verify it fails on the current code (before your changes) and would pass on the correct code. Only then save it to the quest file.
 
-```
-${CLAUDE_PLUGIN_ROOT}/bin/check-ast <file> '<query>' [options]
-```
+## Gate templates
 
-The hook runner expands `${CLAUDE_PLUGIN_ROOT}` automatically when running from a plugin context. For gates run via bash directly, use the resolved path.
-
-## Gate Templates — Tree-sitter Queries
-
-Match the task to a template. Fill in the blanks. To figure out the right query structure, run `tree-sitter parse <file>` first to see the AST node types for the target language.
+Below are ready-to-use templates. Replace `$FILE`, `$FN_NAME`, `$PARAM_NAME`, etc. with actual values. Always use absolute paths for `$FILE`.
 
 ### JS/TS: Function has parameter
 
-```bash
-check-ast $FILE '(function_declaration
-  name: (identifier) @fn
-  parameters: (formal_parameters
-    (assignment_pattern left: (identifier) @p))
-  (#eq? @fn "$FN_NAME")
-  (#eq? @p "$PARAM_NAME"))'
+```
+${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE '(function_declaration name: (identifier) @fn parameters: (formal_parameters (assignment_pattern left: (identifier) @p)) (#eq? @fn "$FN_NAME") (#eq? @p "$PARAM_NAME"))'
 ```
 
 For required (non-default) params:
-```bash
-check-ast $FILE '(function_declaration
-  name: (identifier) @fn
-  parameters: (formal_parameters (identifier) @p)
-  (#eq? @fn "$FN_NAME")
-  (#eq? @p "$PARAM_NAME"))'
+
+```
+${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE '(function_declaration name: (identifier) @fn parameters: (formal_parameters (identifier) @p) (#eq? @fn "$FN_NAME") (#eq? @p "$PARAM_NAME"))'
 ```
 
-### JS/TS: All calls have N+ arguments
+### JS/TS: All calls to function have N+ arguments
 
-```bash
-# Calls with 2 args (use N (_) nodes for N args)
-check-ast $FILE '(call_expression
-  function: (identifier) @fn
-  arguments: (arguments (_) (_))
-  (#eq? @fn "$FN_NAME"))' --min $CALL_COUNT
+```
+${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE '(call_expression function: (identifier) @fn arguments: (arguments (_) (_)) (#eq? @fn "$FN_NAME"))' --min $CALL_COUNT
 ```
 
-To verify NO calls have fewer than N args, query for calls with <N args and use `--zero`:
-```bash
-# No 1-arg calls remain
-check-ast $FILE '(call_expression
-  function: (identifier) @fn
-  arguments: (arguments (_) .)
-  (#eq? @fn "$FN_NAME"))' --zero
+To verify NO calls have fewer than N args, query for short calls and use `--zero`:
+
+```
+${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE '(call_expression function: (identifier) @fn arguments: (arguments (_) .) (#eq? @fn "$FN_NAME"))' --zero
 ```
 
 ### JS/TS: Function exists
 
-```bash
-check-ast $FILE '(function_declaration
-  name: (identifier) @fn
-  (#eq? @fn "$FN_NAME"))'
+```
+${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE '(function_declaration name: (identifier) @fn (#eq? @fn "$FN_NAME"))'
 ```
 
 ### JS/TS: No references to old name (rename complete)
 
-```bash
-check-ast $FILE '((identifier) @id (#eq? @id "$OLD_NAME"))' --zero
+```
+${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE '((identifier) @id (#eq? @id "$OLD_NAME"))' --zero
 ```
 
 ### Python: Function has parameter
 
-```bash
-check-ast $FILE '(function_definition
-  name: (identifier) @fn
-  parameters: (parameters
-    (default_parameter name: (identifier) @p))
-  (#eq? @fn "$FN_NAME")
-  (#eq? @p "$PARAM_NAME"))'
+```
+${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE '(function_definition name: (identifier) @fn parameters: (parameters (default_parameter name: (identifier) @p)) (#eq? @fn "$FN_NAME") (#eq? @p "$PARAM_NAME"))'
 ```
 
-### Python: All calls have N+ arguments
+### Python: All calls pass keyword argument
 
-```bash
-check-ast $FILE '(call
-  function: (identifier) @fn
-  arguments: (argument_list (keyword_argument name: (identifier) @kw))
-  (#eq? @fn "$FN_NAME")
-  (#eq? @kw "$PARAM_NAME"))' --min $CALL_COUNT
+```
+${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE '(call function: (identifier) @fn arguments: (argument_list (keyword_argument name: (identifier) @kw)) (#eq? @fn "$FN_NAME") (#eq? @kw "$PARAM_NAME"))' --min $CALL_COUNT
 ```
 
 ### Rust: Function has parameter
 
-```bash
-check-ast $FILE '(function_item
-  name: (identifier) @fn
-  parameters: (parameters (parameter pattern: (identifier) @p))
-  (#eq? @fn "$FN_NAME")
-  (#eq? @p "$PARAM_NAME"))'
+```
+${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE '(function_item name: (identifier) @fn parameters: (parameters (parameter pattern: (identifier) @p)) (#eq? @fn "$FN_NAME") (#eq? @p "$PARAM_NAME"))'
 ```
 
-## Discovering Query Patterns
+### Unknown language or unfamiliar structure
 
-When writing gates for a new language or unfamiliar AST structure:
-
-1. Run `tree-sitter parse <file>` to see the full S-expression AST
+1. Run `tree-sitter parse <file>` — read the full AST
 2. Find the nodes you care about
-3. Write a query that matches that structure
-4. Test with `check-ast <file> '<query>'` before saving the quest
+3. Write a query matching that structure
+4. Test with `check-ast` before saving
 
-## Quest File Format
+## Subcommands
+
+### `/quest` or `/quest list`
+
+List active quests, run gates, show pass/fail.
+
+### `/quest create`
+
+1. Ask the user what the task is (or infer from context)
+2. Run `tree-sitter parse` on the target files to see AST structure
+3. Write gates using `check-ast` and the templates above
+4. Present quest for user approval
+5. Write to `.claude/quests/<name>.json`
+
+### `/quest check`
+
+Re-run all gates with verbose failure output.
+
+### `/quest done <name>`
+
+Run all gates. If ALL pass, archive to `.claude/quests/done/`. Refuse if any fail.
+
+### `/quest abandon <name>`
+
+Delete the quest file. For when the task changes or gates are wrong.
+
+## Complete example
+
+Task: "Add a `language` parameter to `greet()` in `app.js`, update both call sites"
+
+First, run `tree-sitter parse app.js` to see the AST. Then write the quest:
+
+```json
+{
+  "name": "add-language-param",
+  "description": "Add language param to greet(), update both call sites",
+  "created": "2026-03-25T00:00:00Z",
+  "gates": [
+    {
+      "name": "greet() has language param",
+      "check": "${CLAUDE_PLUGIN_ROOT}/bin/check-ast /absolute/path/to/app.js '(function_declaration name: (identifier) @fn parameters: (formal_parameters (assignment_pattern left: (identifier) @p)) (#eq? @fn \"greet\") (#eq? @p \"language\"))'"
+    },
+    {
+      "name": "both call sites pass 2 arguments",
+      "check": "${CLAUDE_PLUGIN_ROOT}/bin/check-ast /absolute/path/to/app.js '(call_expression function: (identifier) @fn arguments: (arguments (_) (_)) (#eq? @fn \"greet\"))' --min 2"
+    },
+    {
+      "name": "no single-arg calls to greet remain",
+      "check": "${CLAUDE_PLUGIN_ROOT}/bin/check-ast /absolute/path/to/app.js '(call_expression function: (identifier) @fn arguments: (arguments (_) .) (#eq? @fn \"greet\"))' --zero"
+    }
+  ]
+}
+```
+
+## Quest file format
 
 ```json
 {
@@ -173,16 +185,17 @@ When writing gates for a new language or unfamiliar AST structure:
   "gates": [
     {
       "name": "human-readable gate description",
-      "check": "shell command that exits 0 on success"
+      "check": "${CLAUDE_PLUGIN_ROOT}/bin/check-ast <file> '<tree-sitter-query>' [options]"
     }
   ]
 }
 ```
 
+Quest files are immutable after creation. To change gates, `/quest abandon` and recreate.
+
 ## Lifecycle
 
-1. Plan approved → `plan-to-quest` hook fires → marker set
-2. Quest gates defined → marker cleared → edits unblocked
+1. Plan approved → hook fires → marker set
+2. Gates defined with `check-ast` → marker cleared → edits unblocked
 3. Work proceeds
-4. `git commit` → all gates verified → **auto-archived** to `.claude/quests/done/`
-5. Quest cleanup is automatic. No manual `/quest done` needed.
+4. `git commit` → all gates verified → auto-archived to `.claude/quests/done/`
