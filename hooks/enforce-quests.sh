@@ -7,9 +7,9 @@ set -euo pipefail
 INPUT=$(cat)
 COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)
 
-# Block deletion of quest files
-if echo "$COMMAND" | grep -qE '(rm|unlink)' && echo "$COMMAND" | grep -q '\.claude/quests'; then
-  echo '{"decision":"block","reason":"BLOCKED: Cannot delete quest files. Only the user can remove quests. Ask them to run: ! rm .claude/quests/<name>.json"}'
+# Block deletion of quest files — match rm/unlink at start of command or after && / ; / |
+if echo "$COMMAND" | grep -qE '(^|&&|;|\|)\s*(rm|unlink)\s' && echo "$COMMAND" | grep -q '\.claude/quests'; then
+  echo '{"decision":"block","reason":"BLOCKED: Cannot delete quest files. Only the user can remove quests. Ask them to run: ! rm the quest file"}'
   exit 0
 fi
 
