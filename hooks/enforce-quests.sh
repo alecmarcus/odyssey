@@ -60,6 +60,7 @@ else
   # All gates pass — auto-archive completed quests
   if echo "$COMMAND" | grep -qE 'git\s+commit'; then
     mkdir -p "$QUEST_DIR/done"
+    echo 'done/' > "$QUEST_DIR/.gitignore" 2>/dev/null || true
     for quest_file in "${QUEST_FILES[@]}"; do
       [ -f "$quest_file" ] || continue
       mv "$quest_file" "$QUEST_DIR/done/"
