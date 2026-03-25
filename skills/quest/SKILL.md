@@ -135,9 +135,11 @@ ${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE '<tree-sitter-query>' [--min N] [--max
 
 To discover the query structure, run `tree-sitter parse <file>` first.
 
-## Writing good gates — semantic, not structural
+## Writing good gates — more is better
 
-Gates should verify MEANING, not just PRESENCE. Prefer gates that check:
+**Overshoot on gates.** A quest with 10 tight gates is better than one with 3 loose ones. Each gate is cheap to run but expensive to cheat. When in doubt, add another gate.
+
+Gates should verify MEANING, not just PRESENCE:
 
 1. **Signature + defaults**: `--check fn-params greet name language="en"` not just "language exists"
 2. **All call sites updated**: `--check call-min-args greet 2` not just "greet is called"
@@ -146,6 +148,44 @@ Gates should verify MEANING, not just PRESENCE. Prefer gates that check:
 5. **Assignments correct**: `--check assigned result greet` not just "result exists"
 6. **Old patterns gone**: raw query with `--zero` for removed identifiers
 7. **Compound relationships**: `--all` to enforce multiple properties together
+
+### Tests as gates
+
+Every quest that modifies code should include a gate verifying tests were added or updated. Use `check-ast` to verify the test FILE has the right structure:
+
+```
+${CLAUDE_PLUGIN_ROOT}/bin/check-ast $TEST_FILE --check symbol-used test_greet_language
+```
+
+This verifies a test function `test_greet_language` exists AND is referenced (not dead code). Do this for each test case you expect.
+
+### Metagates — for complex or hard-to-verify work
+
+Some changes are too complex to verify structurally (deep algorithmic changes, multi-file refactors with emergent behavior, protocol implementations). For these, add **metagates** — gates that verify the verification:
+
+- **Test file exists**: raw query on the test file to check it was created
+- **Test covers the change**: `--check symbol-used` on expected test function names
+- **Test assertions present**: raw query for assertion nodes (`(call_expression function: (identifier) @fn (#match? @fn "assert|expect|should"))`)
+- **Minimum test count**: raw query with `--min N` for the number of test functions
+
+Example metagate set for a complex feature:
+
+```json
+{
+  "name": "test file created for auth middleware",
+  "check": "${CLAUDE_PLUGIN_ROOT}/bin/check-ast /path/test_auth.py '(function_definition name: (identifier) @fn (#match? @fn \"test_\"))' --min 3"
+},
+{
+  "name": "tests include assertions",
+  "check": "${CLAUDE_PLUGIN_ROOT}/bin/check-ast /path/test_auth.py '(call function: (attribute object: (_) attribute: (identifier) @m) (#match? @m \"assert|assertEqual|assertTrue\"))' --min 3"
+},
+{
+  "name": "tests cover both success and failure paths",
+  "check": "${CLAUDE_PLUGIN_ROOT}/bin/check-ast /path/test_auth.py --all '(function_definition name: (identifier) @fn (#match? @fn \"test_.*success|test_.*valid\"))' --min 1 -- '(function_definition name: (identifier) @fn (#match? @fn \"test_.*fail|test_.*invalid|test_.*error\"))' --min 1"
+}
+```
+
+The principle: if you can't gate the implementation directly, gate the tests that verify the implementation. Tests are code — they have AST structure — they can be gated.
 
 ## Subcommands
 
