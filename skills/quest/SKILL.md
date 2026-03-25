@@ -6,7 +6,7 @@ user_invocable: true
 
 # Quests
 
-Quests are mechanically enforced task contracts. Each quest defines **gates** — shell commands that must exit 0. Hooks block `git commit` and `git push` until every active gate passes. The Stop hook warns you if you try to finish with failing gates.
+Quests are mechanically enforced task contracts. Each quest defines **gates** — shell commands that must exit 0. Hooks block `git commit`, `git push`, and `stop` until every active gate passes.
 
 Quest files live at `.claude/quests/<name>.json` in the project directory.
 
@@ -32,9 +32,10 @@ Quest: <name> — <description>
 Create a new quest for the current task. Steps:
 
 1. Ask the user what the task is (or infer from recent conversation context)
-2. Analyze the task and design gates
-3. Present the quest to the user for approval
-4. On approval, write to `.claude/quests/<name>.json`
+2. Parse intent into a structured pattern (see Gate Templates below)
+3. Generate gates mechanically from templates
+4. Present the quest to the user for approval
+5. On approval, write to `.claude/quests/<name>.json`
 
 ### `/quest check`
 Same as `list` but re-runs all gates and shows verbose output for failures (include stderr).
@@ -47,39 +48,116 @@ Same as `list` but re-runs all gates and shows verbose output for failures (incl
 ### `/quest abandon <name>`
 Remove the quest file without verification. For when the task changes or gates are wrong.
 
-## Creating Gates — CRITICAL RULES
+## Gate Templates
 
-Gates are the entire point. Bad gates = no enforcement. Follow these rules:
+Generate gates from these templates. Do NOT write gates from scratch — match the task to a template and fill in the blanks.
 
-### 1. Check the substance, not the form
-BAD: `grep -q 'newParam' src/handler.ts` — catches a comment, a string, anything
-GOOD: `grep -qP 'function processRequest\(.*timeout:\s*number' src/handler.ts` — checks actual signature
+IMPORTANT: Use `grep -E` (extended regex), NOT `grep -P` (Perl regex). macOS BSD grep does not support `-P`.
 
-### 2. Check both sides of a change
-If adding a param, verify BOTH:
-- The declaration has it: `grep -qP 'function fn\(.*newParam' src/module.ts`
-- Call sites use it: `test $(grep -rn 'fn(' src/ --include='*.ts' | grep -v 'function fn' | grep -v newParam | wc -l) -eq 0`
+### ADD PARAM: Add parameter `$PARAM` to function `$FN` in `$FILE`, update call sites
 
-### 3. Use negative checks to catch staleness
-`! grep -rq 'oldPattern' src/` — verify the OLD thing is gone, not just that the new thing exists.
-
-### 4. Count when counts matter
-`test $(grep -c 'fn(.*newParam)' src/ -r --include='*.ts') -ge 5` — if there are 5 call sites, verify 5 updates.
-
-### 5. Run tests when they exist
-`cd "$PROJECT_DIR" && npm test` or `cargo test` — the test suite IS a gate.
-
-### 6. Use scripts for complex checks
-For anything beyond grep, write a small inline script:
-```bash
-node -e "const src = require('fs').readFileSync('src/handler.ts','utf8'); const match = src.match(/function processRequest\((.*?)\)/); if (!match || !match[1].includes('timeout')) process.exit(1);"
+```json
+[
+  {
+    "name": "$FN() signature has $PARAM param",
+    "check": "grep -qE '(def|function|fn|pub fn) $FN\\(.*$PARAM' $FILE"
+  },
+  {
+    "name": "all call sites pass $PARAM",
+    "check": "test $(grep -E '$FN\\(' $FILE | grep -v '(def |function |fn |pub fn )' | grep -v '$PARAM' | wc -l | tr -d ' ') -eq 0"
+  },
+  {
+    "name": "expected number of call sites updated",
+    "check": "test $(grep -E '$FN\\(.*$PARAM' $FILE | grep -v '(def |function |fn |pub fn )' | wc -l | tr -d ' ') -ge $COUNT"
+  }
+]
 ```
 
-### 7. Be specific about file paths
-Don't glob the entire repo. Target the specific files that should change.
+### RENAME: Rename `$OLD` to `$NEW` across `$GLOB`
 
-### 8. Timeout every check
-All checks run with `timeout 30`. If your check needs more than 30s, it's too expensive for a gate.
+```json
+[
+  {
+    "name": "$OLD is gone from all source files",
+    "check": "test $(grep -rE '$OLD' $GLOB | wc -l | tr -d ' ') -eq 0"
+  },
+  {
+    "name": "$NEW exists in expected files",
+    "check": "grep -rqE '$NEW' $GLOB"
+  }
+]
+```
+
+### MOVE FILE: Move `$SRC` to `$DST`, update imports
+
+```json
+[
+  {
+    "name": "old file is gone",
+    "check": "test ! -f $SRC"
+  },
+  {
+    "name": "new file exists",
+    "check": "test -f $DST"
+  },
+  {
+    "name": "no imports reference old path",
+    "check": "test $(grep -rE '(import|require|from).*$OLD_MODULE' $GLOB | wc -l | tr -d ' ') -eq 0"
+  }
+]
+```
+
+### ADD FILE: Create `$FILE` with required content
+
+```json
+[
+  {
+    "name": "file exists",
+    "check": "test -f $FILE"
+  },
+  {
+    "name": "file contains required pattern",
+    "check": "grep -qE '$PATTERN' $FILE"
+  }
+]
+```
+
+### DELETE: Remove `$PATTERN` from `$GLOB`
+
+```json
+[
+  {
+    "name": "$PATTERN is gone",
+    "check": "test $(grep -rE '$PATTERN' $GLOB | wc -l | tr -d ' ') -eq 0"
+  }
+]
+```
+
+### TESTS PASS
+
+```json
+[
+  {
+    "name": "test suite passes",
+    "check": "cd $PROJECT && $TEST_CMD"
+  }
+]
+```
+
+### CUSTOM: For anything not covered above
+
+Write a gate using `grep -E`, `test`, or an inline script. Follow the rules below.
+
+## Gate Rules
+
+1. **Use templates first.** Only write custom gates when no template fits.
+2. **Check substance, not form.** Match the function/class/signature, not just a keyword.
+3. **Check both sides.** Verify the new thing exists AND the old thing is gone.
+4. **Count when counts matter.** If there are N call sites, verify N updates.
+5. **Use `grep -E`**, not `grep -P`. macOS compatibility.
+6. **Be specific about paths.** Don't glob the entire repo.
+7. **Always add a test gate** when the project has a test suite.
+8. **Inline scripts** for complex checks: `node -e "..."`, `python3 -c "..."`.
 
 ## Quest File Format
 
@@ -87,7 +165,7 @@ All checks run with `timeout 30`. If your check needs more than 30s, it's too ex
 {
   "name": "descriptive-kebab-name",
   "description": "One-line description of what this quest verifies",
-  "created": "2026-03-24T00:00:00Z",
+  "created": "ISO-8601",
   "gates": [
     {
       "name": "human-readable gate description",
@@ -101,40 +179,9 @@ All checks run with `timeout 30`. If your check needs more than 30s, it's too ex
 
 ```
 .claude/quests/
-  add-timeout-param.json     # active quest
-  fix-auth-middleware.json    # active quest
+  active-quest.json
   done/
-    migrate-database.json    # completed quest (archived)
+    completed-quest.json
 ```
 
-Create `.claude/quests/` and `.claude/quests/done/` as needed.
-
-## Example Quest
-
-Task: "Add a `timeout` parameter to `processRequest()` and pass it at all call sites"
-
-```json
-{
-  "name": "add-timeout-param",
-  "description": "Add timeout param to processRequest and update all 4 call sites",
-  "created": "2026-03-24T00:00:00Z",
-  "gates": [
-    {
-      "name": "processRequest signature has timeout param",
-      "check": "grep -qP 'function processRequest\\(.*timeout' src/handler.ts"
-    },
-    {
-      "name": "no call sites without timeout arg",
-      "check": "test $(grep -rn 'processRequest(' src/ --include='*.ts' | grep -v 'function processRequest' | grep -v timeout | wc -l) -eq 0"
-    },
-    {
-      "name": "timeout param has correct type",
-      "check": "grep -qP 'timeout:\\s*number' src/handler.ts"
-    },
-    {
-      "name": "tests pass",
-      "check": "cd /path/to/project && npm test 2>&1"
-    }
-  ]
-}
-```
+Create directories as needed.
