@@ -143,9 +143,15 @@ Re-run all gates with verbose failure output.
 
 Run all gates. If ALL pass, archive to `.claude/quests/done/`. Refuse if any fail.
 
-### `/quest abandon <name>`
+### Abandoning a quest
 
-Delete the quest file. For when the task changes or gates are wrong.
+You cannot delete quest files. Only the user can. If gates are wrong or the task changed, tell the user to run:
+
+```
+! rm .claude/quests/<name>.json
+```
+
+The `!` prefix runs the command in the user's shell, outside of hooks.
 
 ## Complete example
 

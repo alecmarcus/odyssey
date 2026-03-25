@@ -19,10 +19,9 @@ if echo "$FILE_PATH" | grep -q '\.claude/quests/done/'; then
   exit 0
 fi
 
-# Quest files are immutable once created. Can't edit, only abandon + recreate.
-# Prevents weakening gates and satisfying them in one shot.
+# Quest files are immutable. Only the user can remove them.
 if [ -f "$FILE_PATH" ]; then
-  echo '{"decision":"block","reason":"BLOCKED: Quest files are immutable. You cannot edit an existing quest. To change gates, run /quest abandon <name> and create a new quest."}'
+  echo '{"decision":"block","reason":"BLOCKED: Quest files are immutable. Ask the user to delete it: ! rm .claude/quests/<name>.json"}'
   exit 0
 fi
 

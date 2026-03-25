@@ -9,7 +9,7 @@ COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)
 
 # Block deletion of quest files
 if echo "$COMMAND" | grep -qE '(rm|unlink)' && echo "$COMMAND" | grep -q '\.claude/quests'; then
-  echo '{"decision":"block","reason":"BLOCKED: Cannot delete quest files via shell. Use /quest abandon to remove a quest."}'
+  echo '{"decision":"block","reason":"BLOCKED: Cannot delete quest files. Only the user can remove quests. Ask them to run: ! rm .claude/quests/<name>.json"}'
   exit 0
 fi
 
