@@ -2,30 +2,395 @@
 # AST gate checker using tree-sitter queries.
 # Cheat-proof: operates on parsed AST, not text. Comments/strings are invisible.
 #
-# Usage:
-#   check-ast <file> <query-file|inline-query> [options]
+# MODES:
 #
-# Options:
-#   --min N      query must match at least N times (default: 1)
-#   --max N      query must match at most N times
-#   --exact N    query must match exactly N times
-#   --zero       query must match 0 times (shorthand for --exact 0)
+# 1. Raw query (most flexible):
+#    check-ast <file> '<tree-sitter-query>' [--min N] [--max N] [--exact N] [--zero]
 #
-# Examples:
-#   check-ast app.js query.scm --min 2
-#   check-ast app.js '(function_declaration name:(identifier) @fn (#eq? @fn "greet"))' --min 1
-#   check-ast app.js '(call_expression function:(identifier) @fn (#eq? @fn "oldName"))' --zero
+# 2. Compound (ALL queries must pass):
+#    check-ast <file> --all '<query1>' [opts1] -- '<query2>' [opts2] -- ...
+#
+# 3. High-level checks (generate queries automatically):
+#    check-ast <file> --check fn-params <fnName> <p1> [p2=default] ...
+#    check-ast <file> --check call-min-args <fnName> <N>
+#    check-ast <file> --check call-arg-matches <fnName> <argPos> <regex>
+#    check-ast <file> --check symbol-used <name>
+#    check-ast <file> --check import-used <name>
+#    check-ast <file> --check assigned <varName> <valuePattern>
 
 set -euo pipefail
 
+fail() { echo "FAIL: $*" >&2; exit 1; }
+
+run_query() {
+  local file="$1" query="$2" min="${3:-}" max="${4:-}" exact="${5:-}"
+
+  local qfile
+  if [ -f "$query" ]; then
+    qfile="$query"
+  else
+    qfile=$(mktemp -t odyssey-query)
+    echo "$query" > "$qfile"
+  fi
+
+  local count
+  count=$(tree-sitter query "$qfile" "$file" 2>&1 | grep -c "^  pattern:" || true)
+
+  [ -f "$query" ] || rm -f "$qfile"
+
+  # Default: at least 1
+  if [ -z "$min" ] && [ -z "$max" ] && [ -z "$exact" ]; then
+    min=1
+  fi
+
+  if [ -n "$exact" ] && [ "$count" -ne "$exact" ]; then
+    fail "expected exactly $exact match(es), got $count"
+  fi
+  if [ -n "$min" ] && [ "$count" -lt "$min" ]; then
+    fail "expected at least $min match(es), got $count"
+  fi
+  if [ -n "$max" ] && [ "$count" -gt "$max" ]; then
+    fail "expected at most $max match(es), got $count"
+  fi
+}
+
+# Get captures with their text values
+get_captures() {
+  local file="$1" query="$2"
+  local qfile
+  if [ -f "$query" ]; then
+    qfile="$query"
+  else
+    qfile=$(mktemp -t odyssey-query)
+    echo "$query" > "$qfile"
+  fi
+  tree-sitter query "$qfile" "$file" 2>&1
+  [ -f "$query" ] || rm -f "$qfile"
+}
+
+# Detect language from file extension
+detect_lang() {
+  case "$1" in
+    *.js|*.jsx|*.mjs)   echo "js" ;;
+    *.ts|*.tsx)          echo "ts" ;;
+    *.py)                echo "py" ;;
+    *.rs)                echo "rs" ;;
+    *.go)                echo "go" ;;
+    *.swift)             echo "swift" ;;
+    *.kt|*.kts)          echo "kt" ;;
+    *.java)              echo "java" ;;
+    *.c|*.h)             echo "c" ;;
+    *.cpp|*.hpp|*.cc)    echo "cpp" ;;
+    *.lua)               echo "lua" ;;
+    *.rb)                echo "rb" ;;
+    *.php)               echo "php" ;;
+    *)                   echo "unknown" ;;
+  esac
+}
+
+# --- High-level check: fn-params ---
+# Verify function has specific parameters (in order, with optional defaults)
+check_fn_params() {
+  local file="$1" fn_name="$2"
+  shift 2
+  local lang
+  lang=$(detect_lang "$file")
+
+  # Build query for each param and verify
+  local idx=0
+  for param_spec in "$@"; do
+    local param_name default_val
+    if echo "$param_spec" | grep -q '='; then
+      param_name="${param_spec%%=*}"
+      default_val="${param_spec#*=}"
+    else
+      param_name="$param_spec"
+      default_val=""
+    fi
+
+    # Strip surrounding quotes from default value — #match? is a regex on node text
+    local escaped_default
+    escaped_default=$(echo "$default_val" | sed 's/^"//;s/"$//')
+
+    local query
+    case "$lang" in
+      js|ts)
+        if [ -n "$default_val" ]; then
+          query="(function_declaration name: (identifier) @fn parameters: (formal_parameters (assignment_pattern left: (identifier) @p right: (_) @default)) (#eq? @fn \"$fn_name\") (#eq? @p \"$param_name\") (#match? @default \"$escaped_default\"))"
+        else
+          # Match either plain identifier or destructuring pattern with this name
+          query="(function_declaration name: (identifier) @fn parameters: (formal_parameters (identifier) @p) (#eq? @fn \"$fn_name\") (#eq? @p \"$param_name\"))"
+        fi
+        ;;
+      py)
+        if [ -n "$default_val" ]; then
+          query="(function_definition name: (identifier) @fn parameters: (parameters (default_parameter name: (identifier) @p value: (_) @default)) (#eq? @fn \"$fn_name\") (#eq? @p \"$param_name\") (#match? @default \"$escaped_default\"))"
+        else
+          query="(function_definition name: (identifier) @fn parameters: (parameters (identifier) @p) (#eq? @fn \"$fn_name\") (#eq? @p \"$param_name\"))"
+        fi
+        ;;
+      rs)
+        query="(function_item name: (identifier) @fn parameters: (parameters (parameter pattern: (identifier) @p)) (#eq? @fn \"$fn_name\") (#eq? @p \"$param_name\"))"
+        ;;
+      *)
+        fail "fn-params not implemented for $lang files. Use a raw query."
+        ;;
+    esac
+
+    run_query "$file" "$query" 1 "" ""
+    idx=$((idx + 1))
+  done
+}
+
+# --- High-level check: call-min-args ---
+# Verify all calls to function have at least N arguments
+# Strategy: count total calls, count calls with N+ args, compare
+check_call_min_args() {
+  local file="$1" fn_name="$2" min_args="$3"
+  local lang
+  lang=$(detect_lang "$file")
+
+  # Build N (_) pattern for "at least N args"
+  local args_pattern=""
+  local j
+  for j in $(seq 1 "$min_args"); do
+    args_pattern="$args_pattern (_)"
+  done
+
+  local total_query good_query
+  case "$lang" in
+    js|ts)
+      total_query="(call_expression function: (identifier) @fn (#eq? @fn \"$fn_name\"))"
+      good_query="(call_expression function: (identifier) @fn arguments: (arguments ${args_pattern}) (#eq? @fn \"$fn_name\"))"
+      ;;
+    py)
+      total_query="(call function: (identifier) @fn (#eq? @fn \"$fn_name\"))"
+      good_query="(call function: (identifier) @fn arguments: (argument_list ${args_pattern}) (#eq? @fn \"$fn_name\"))"
+      ;;
+    *)
+      fail "call-min-args not implemented for $lang files. Use a raw query."
+      ;;
+  esac
+
+  local qf1 qf2 total good
+  qf1=$(mktemp -t odyssey-query)
+  qf2=$(mktemp -t odyssey-query)
+  echo "$total_query" > "$qf1"
+  echo "$good_query" > "$qf2"
+  total=$(tree-sitter query "$qf1" "$file" 2>&1 | grep -c "^  pattern:" || true)
+  good=$(tree-sitter query "$qf2" "$file" 2>&1 | grep -c "^  pattern:" || true)
+  rm -f "$qf1" "$qf2"
+
+  if [ "$total" -eq 0 ]; then
+    fail "no calls to '$fn_name' found"
+  fi
+  if [ "$good" -lt "$total" ]; then
+    fail "$((total - good)) of $total call(s) to '$fn_name' have fewer than $min_args arg(s)"
+  fi
+}
+
+# --- High-level check: call-arg-matches ---
+# Verify all calls to function have an arg at position N matching a regex
+check_call_arg_matches() {
+  local file="$1" fn_name="$2" arg_pos="$3" regex="$4"
+  local lang
+  lang=$(detect_lang "$file")
+
+  # Build arg pattern: (_) for positions before target, then captured arg
+  local args_before=""
+  local i
+  for i in $(seq 1 $((arg_pos - 1))); do
+    args_before="$args_before (_)"
+  done
+
+  local query
+  case "$lang" in
+    js|ts)
+      query="(call_expression function: (identifier) @fn arguments: (arguments ${args_before} (_) @target) (#eq? @fn \"$fn_name\") (#match? @target \"$regex\"))"
+      ;;
+    py)
+      query="(call function: (identifier) @fn arguments: (argument_list ${args_before} (_) @target) (#eq? @fn \"$fn_name\") (#match? @target \"$regex\"))"
+      ;;
+    *)
+      fail "call-arg-matches not implemented for $lang files. Use a raw query."
+      ;;
+  esac
+
+  # Count total calls vs matching calls
+  local total_query match_query
+  case "$lang" in
+    js|ts)
+      total_query="(call_expression function: (identifier) @fn (#eq? @fn \"$fn_name\"))"
+      ;;
+    py)
+      total_query="(call function: (identifier) @fn (#eq? @fn \"$fn_name\"))"
+      ;;
+  esac
+
+  local qf1 qf2 total matching
+  qf1=$(mktemp -t odyssey-query)
+  qf2=$(mktemp -t odyssey-query)
+  echo "$total_query" > "$qf1"
+  echo "$query" > "$qf2"
+  total=$(tree-sitter query "$qf1" "$file" 2>&1 | grep -c "^  pattern:" || true)
+  matching=$(tree-sitter query "$qf2" "$file" 2>&1 | grep -c "^  pattern:" || true)
+  rm -f "$qf1" "$qf2"
+
+  if [ "$total" -eq 0 ]; then
+    fail "no calls to '$fn_name' found"
+  fi
+  if [ "$matching" -lt "$total" ]; then
+    fail "$((total - matching)) of $total call(s) to '$fn_name' have arg $arg_pos not matching /$regex/"
+  fi
+}
+
+# --- High-level check: symbol-used ---
+# Verify identifier appears at least twice (declared + used)
+check_symbol_used() {
+  local file="$1" name="$2"
+  run_query "$file" "((identifier) @id (#eq? @id \"$name\"))" 2 "" ""
+}
+
+# --- High-level check: import-used ---
+# Verify a symbol is imported AND referenced beyond the import
+check_import_used() {
+  local file="$1" name="$2"
+  local lang
+  lang=$(detect_lang "$file")
+
+  # Check import exists
+  local import_query
+  case "$lang" in
+    js|ts)
+      import_query="(import_specifier name: (identifier) @imp (#eq? @imp \"$name\"))"
+      ;;
+    py)
+      import_query="(import_from_statement name: (dotted_name (identifier) @imp) (#eq? @imp \"$name\"))"
+      ;;
+    *)
+      fail "import-used not implemented for $lang files. Use a raw query."
+      ;;
+  esac
+
+  run_query "$file" "$import_query" 1 "" ""
+
+  # Check usage beyond import (at least 2 total references: import + use)
+  run_query "$file" "((identifier) @id (#eq? @id \"$name\"))" 2 "" ""
+}
+
+# --- High-level check: assigned ---
+# Verify a variable is assigned from an expression matching a pattern
+check_assigned() {
+  local file="$1" var_name="$2" value_pattern="$3"
+  local lang
+  lang=$(detect_lang "$file")
+
+  local query
+  case "$lang" in
+    js|ts)
+      query="(variable_declarator name: (identifier) @var value: (_) @val (#eq? @var \"$var_name\") (#match? @val \"$value_pattern\"))"
+      ;;
+    py)
+      query="(assignment left: (identifier) @var right: (_) @val (#eq? @var \"$var_name\") (#match? @val \"$value_pattern\"))"
+      ;;
+    rs)
+      query="(let_declaration pattern: (identifier) @var value: (_) @val (#eq? @var \"$var_name\") (#match? @val \"$value_pattern\"))"
+      ;;
+    *)
+      fail "assigned not implemented for $lang files. Use a raw query."
+      ;;
+  esac
+
+  run_query "$file" "$query" 1 "" ""
+}
+
+# =====================
+# MAIN DISPATCH
+# =====================
+
 if [ $# -lt 2 ]; then
-  echo "Usage: check-ast <file> <query> [--min N] [--max N] [--exact N] [--zero]" >&2
+  cat >&2 << 'USAGE'
+Usage:
+  check-ast <file> '<query>' [--min N] [--max N] [--exact N] [--zero]
+  check-ast <file> --all '<q1>' [opts] -- '<q2>' [opts] -- ...
+  check-ast <file> --check fn-params <fn> <p1> [p2=default] ...
+  check-ast <file> --check call-min-args <fn> <N>
+  check-ast <file> --check call-arg-matches <fn> <pos> <regex>
+  check-ast <file> --check symbol-used <name>
+  check-ast <file> --check import-used <name>
+  check-ast <file> --check assigned <var> <valueRegex>
+USAGE
   exit 2
 fi
 
 FILE="$1"
-QUERY_INPUT="$2"
-shift 2
+shift
+
+if [ ! -f "$FILE" ]; then
+  fail "file not found: $FILE"
+fi
+
+# Mode: --check (high-level)
+if [ "$1" = "--check" ]; then
+  shift
+  CHECK_TYPE="$1"
+  shift
+  case "$CHECK_TYPE" in
+    fn-params)        check_fn_params "$FILE" "$@" ;;
+    call-min-args)    check_call_min_args "$FILE" "$@" ;;
+    call-arg-matches) check_call_arg_matches "$FILE" "$@" ;;
+    symbol-used)      check_symbol_used "$FILE" "$@" ;;
+    import-used)      check_import_used "$FILE" "$@" ;;
+    assigned)         check_assigned "$FILE" "$@" ;;
+    *) fail "unknown check type: $CHECK_TYPE" ;;
+  esac
+  exit 0
+fi
+
+# Mode: --all (compound)
+if [ "$1" = "--all" ]; then
+  shift
+  QUERY=""
+  Q_MIN=""
+  Q_MAX=""
+  Q_EXACT=""
+  GATE_NUM=0
+
+  flush_query() {
+    if [ -n "$QUERY" ]; then
+      GATE_NUM=$((GATE_NUM + 1))
+      run_query "$FILE" "$QUERY" "$Q_MIN" "$Q_MAX" "$Q_EXACT" || fail "compound gate $GATE_NUM failed"
+      QUERY=""
+      Q_MIN=""
+      Q_MAX=""
+      Q_EXACT=""
+    fi
+  }
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --)       flush_query; shift ;;
+      --min)    Q_MIN="$2"; shift 2 ;;
+      --max)    Q_MAX="$2"; shift 2 ;;
+      --exact)  Q_EXACT="$2"; shift 2 ;;
+      --zero)   Q_EXACT="0"; shift ;;
+      *)
+        if [ -z "$QUERY" ]; then
+          QUERY="$1"
+        else
+          QUERY="$QUERY $1"
+        fi
+        shift
+        ;;
+    esac
+  done
+  flush_query
+  exit 0
+fi
+
+# Mode: raw query (default)
+QUERY_INPUT="$1"
+shift
 
 MIN=""
 MAX=""
@@ -37,59 +402,8 @@ while [ $# -gt 0 ]; do
     --max)   MAX="$2"; shift 2 ;;
     --exact) EXACT="$2"; shift 2 ;;
     --zero)  EXACT="0"; shift ;;
-    *) echo "Unknown option: $1" >&2; exit 2 ;;
+    *) fail "unknown option: $1" ;;
   esac
 done
 
-# Default: at least 1 match
-if [ -z "$MIN" ] && [ -z "$MAX" ] && [ -z "$EXACT" ]; then
-  MIN=1
-fi
-
-# If query is a file, use it. Otherwise write inline query to temp file.
-if [ -f "$QUERY_INPUT" ]; then
-  QUERY_FILE="$QUERY_INPUT"
-  CLEANUP=""
-else
-  QUERY_FILE=$(mktemp /tmp/odyssey-query-XXXXXX.scm)
-  echo "$QUERY_INPUT" > "$QUERY_FILE"
-  CLEANUP="$QUERY_FILE"
-fi
-
-# Run tree-sitter query, count pattern matches
-COUNT=$(tree-sitter query "$QUERY_FILE" "$FILE" 2>&1 | grep -c "^  pattern:" || true)
-
-# Cleanup temp file
-[ -n "${CLEANUP:-}" ] && rm -f "$CLEANUP"
-
-# Evaluate constraints
-PASS=true
-REASON=""
-
-if [ -n "$EXACT" ]; then
-  if [ "$COUNT" -ne "$EXACT" ]; then
-    PASS=false
-    REASON="expected exactly $EXACT match(es), got $COUNT"
-  fi
-fi
-
-if [ -n "$MIN" ]; then
-  if [ "$COUNT" -lt "$MIN" ]; then
-    PASS=false
-    REASON="expected at least $MIN match(es), got $COUNT"
-  fi
-fi
-
-if [ -n "$MAX" ]; then
-  if [ "$COUNT" -gt "$MAX" ]; then
-    PASS=false
-    REASON="expected at most $MAX match(es), got $COUNT"
-  fi
-fi
-
-if [ "$PASS" = true ]; then
-  exit 0
-else
-  echo "FAIL: $REASON" >&2
-  exit 1
-fi
+run_query "$FILE" "$QUERY_INPUT" "$MIN" "$MAX" "$EXACT"

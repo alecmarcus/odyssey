@@ -56,70 +56,96 @@ Options:
 
 Run the command. Verify it fails on the current code (before your changes) and would pass on the correct code. Only then save it to the quest file.
 
-## Gate templates
+## High-level checks (PREFERRED)
 
-Below are ready-to-use templates. Replace `$FILE`, `$FN_NAME`, `$PARAM_NAME`, etc. with actual values. Always use absolute paths for `$FILE`.
+Use `--check` mode. It generates the right tree-sitter queries automatically. Supports JS/TS, Python, Rust.
 
-### JS/TS: Function has parameter
-
-```
-${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE '(function_declaration name: (identifier) @fn parameters: (formal_parameters (assignment_pattern left: (identifier) @p)) (#eq? @fn "$FN_NAME") (#eq? @p "$PARAM_NAME"))'
-```
-
-For required (non-default) params:
+### fn-params — verify function signature with optional defaults
 
 ```
-${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE '(function_declaration name: (identifier) @fn parameters: (formal_parameters (identifier) @p) (#eq? @fn "$FN_NAME") (#eq? @p "$PARAM_NAME"))'
+${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE --check fn-params $FN_NAME param1 param2="defaultValue" param3
 ```
 
-### JS/TS: All calls to function have N+ arguments
+Verifies each parameter exists in the function signature, in order. For defaults, checks the value matches.
+
+### call-min-args — all calls have at least N arguments
 
 ```
-${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE '(call_expression function: (identifier) @fn arguments: (arguments (_) (_)) (#eq? @fn "$FN_NAME"))' --min $CALL_COUNT
+${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE --check call-min-args $FN_NAME $N
 ```
 
-To verify NO calls have fewer than N args, query for short calls and use `--zero`:
+Counts total calls vs calls with N+ args. Fails if any call has fewer.
+
+### call-arg-matches — specific argument matches a regex
 
 ```
-${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE '(call_expression function: (identifier) @fn arguments: (arguments (_) .) (#eq? @fn "$FN_NAME"))' --zero
+${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE --check call-arg-matches $FN_NAME $ARG_POS $REGEX
 ```
 
-### JS/TS: Function exists
+Verifies EVERY call to the function has an argument at position N matching the regex. Fails if any call is missing it or doesn't match.
+
+### symbol-used — declared AND referenced (not dead code)
 
 ```
-${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE '(function_declaration name: (identifier) @fn (#eq? @fn "$FN_NAME"))'
+${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE --check symbol-used $NAME
 ```
 
-### JS/TS: No references to old name (rename complete)
+Verifies the identifier appears at least twice in the AST — once for declaration, once for use. Catches "imported but never called" cheats.
+
+### import-used — imported AND actually referenced
 
 ```
-${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE '((identifier) @id (#eq? @id "$OLD_NAME"))' --zero
+${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE --check import-used $NAME
 ```
 
-### Python: Function has parameter
+Verifies the symbol appears in an import statement AND is referenced elsewhere in the code.
+
+### assigned — variable assigned from matching expression
 
 ```
-${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE '(function_definition name: (identifier) @fn parameters: (parameters (default_parameter name: (identifier) @p)) (#eq? @fn "$FN_NAME") (#eq? @p "$PARAM_NAME"))'
+${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE --check assigned $VAR_NAME $VALUE_REGEX
 ```
 
-### Python: All calls pass keyword argument
+Verifies the variable is assigned from an expression matching the regex. Catches "declared but assigned to wrong thing".
+
+## Compound checks (--all)
+
+Use `--all` to require multiple queries to ALL pass. Separate queries with `--`.
 
 ```
-${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE '(call function: (identifier) @fn arguments: (argument_list (keyword_argument name: (identifier) @kw)) (#eq? @fn "$FN_NAME") (#eq? @kw "$PARAM_NAME"))' --min $CALL_COUNT
+${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE --all '<query1>' --min 1 -- '<query2>' --zero
 ```
 
-### Rust: Function has parameter
+Example: function exists AND all calls have 2+ args:
 
 ```
-${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE '(function_item name: (identifier) @fn parameters: (parameters (parameter pattern: (identifier) @p)) (#eq? @fn "$FN_NAME") (#eq? @p "$PARAM_NAME"))'
+${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE --all \
+  '(function_declaration name:(identifier) @fn (#eq? @fn "greet"))' --min 1 \
+  -- \
+  '(call_expression function:(identifier) @fn arguments:(arguments (_) (_)) (#eq? @fn "greet"))' --min 2
 ```
 
-### Unknown language or unfamiliar structure
+## Raw queries (for edge cases)
 
-1. Run `tree-sitter parse <file>` — read the full AST
-2. Find the nodes you care about
-3. Write a query matching that structure
-4. Test with `check-ast` before saving
+When high-level checks don't cover your case, use a raw tree-sitter query:
+
+```
+${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE '<tree-sitter-query>' [--min N] [--max N] [--exact N] [--zero]
+```
+
+To discover the query structure, run `tree-sitter parse <file>` first.
+
+## Writing good gates — semantic, not structural
+
+Gates should verify MEANING, not just PRESENCE. Prefer gates that check:
+
+1. **Signature + defaults**: `--check fn-params greet name language="en"` not just "language exists"
+2. **All call sites updated**: `--check call-min-args greet 2` not just "greet is called"
+3. **Correct argument values**: `--check call-arg-matches greet 2 "es|fr|en"` not just "has 2 args"
+4. **Imports actually used**: `--check import-used log` not just "log is imported"
+5. **Assignments correct**: `--check assigned result greet` not just "result exists"
+6. **Old patterns gone**: raw query with `--zero` for removed identifiers
+7. **Compound relationships**: `--all` to enforce multiple properties together
 
 ## Subcommands
 
@@ -155,9 +181,7 @@ The `!` prefix runs the command in the user's shell, outside of hooks.
 
 ## Complete example
 
-Task: "Add a `language` parameter to `greet()` in `app.js`, update both call sites"
-
-First, run `tree-sitter parse app.js` to see the AST. Then write the quest:
+Task: "Add a `language` parameter to `greet()` in `app.js`, default `"en"`, update both call sites"
 
 ```json
 {
@@ -166,16 +190,20 @@ First, run `tree-sitter parse app.js` to see the AST. Then write the quest:
   "created": "2026-03-25T00:00:00Z",
   "gates": [
     {
-      "name": "greet() has language param",
-      "check": "${CLAUDE_PLUGIN_ROOT}/bin/check-ast /absolute/path/to/app.js '(function_declaration name: (identifier) @fn parameters: (formal_parameters (assignment_pattern left: (identifier) @p)) (#eq? @fn \"greet\") (#eq? @p \"language\"))'"
+      "name": "greet() has name and language param with default en",
+      "check": "${CLAUDE_PLUGIN_ROOT}/bin/check-ast /absolute/path/app.js --check fn-params greet name language=\"en\""
     },
     {
-      "name": "both call sites pass 2 arguments",
-      "check": "${CLAUDE_PLUGIN_ROOT}/bin/check-ast /absolute/path/to/app.js '(call_expression function: (identifier) @fn arguments: (arguments (_) (_)) (#eq? @fn \"greet\"))' --min 2"
+      "name": "all calls pass at least 2 arguments",
+      "check": "${CLAUDE_PLUGIN_ROOT}/bin/check-ast /absolute/path/app.js --check call-min-args greet 2"
     },
     {
-      "name": "no single-arg calls to greet remain",
-      "check": "${CLAUDE_PLUGIN_ROOT}/bin/check-ast /absolute/path/to/app.js '(call_expression function: (identifier) @fn arguments: (arguments (_) .) (#eq? @fn \"greet\"))' --zero"
+      "name": "second arg is a valid language code",
+      "check": "${CLAUDE_PLUGIN_ROOT}/bin/check-ast /absolute/path/app.js --check call-arg-matches greet 2 \"en|es|fr\""
+    },
+    {
+      "name": "greet is actually called (not just declared)",
+      "check": "${CLAUDE_PLUGIN_ROOT}/bin/check-ast /absolute/path/app.js --check symbol-used greet"
     }
   ]
 }
@@ -197,11 +225,12 @@ First, run `tree-sitter parse app.js` to see the AST. Then write the quest:
 }
 ```
 
-Quest files are immutable after creation. To change gates, `/quest abandon` and recreate.
+Quest files are immutable after creation. Only the user can delete them.
 
 ## Lifecycle
 
 1. Plan approved → hook fires → marker set
 2. Gates defined with `check-ast` → marker cleared → edits unblocked
-3. Work proceeds
-4. `git commit` → all gates verified → auto-archived to `.claude/quests/done/`
+3. Work proceeds, commits are free
+4. `git push` → all gates verified → auto-archived to `.claude/quests/done/`
+5. Subagent return → gates verified → blocked if failing
