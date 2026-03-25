@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# PreToolUse hook (Bash): blocks git commit/push when quest gates are failing.
-# No active quests = no-op (allow everything).
+# PreToolUse hook (Bash): blocks git push when quest gates are failing.
+# Commits are free — push is the ship gate.
 
 set -euo pipefail
 
@@ -13,8 +13,8 @@ if echo "$COMMAND" | grep -qE '(rm|unlink)' && echo "$COMMAND" | grep -q '\.clau
   exit 0
 fi
 
-# Only gate on git commit and git push (anywhere in the command, catches chains)
-if ! echo "$COMMAND" | grep -qE 'git\s+(commit|push)'; then
+# Only gate on git push
+if ! echo "$COMMAND" | grep -qE 'git\s+push'; then
   echo '{"decision":"allow"}'
   exit 0
 fi
@@ -46,7 +46,6 @@ for quest_file in "${QUEST_FILES[@]}"; do
     GATE_NAME=$(echo "$gate" | jq -r '.name // "unnamed gate"')
     GATE_CHECK=$(echo "$gate" | jq -r '.check // "false"')
 
-    # Run check with 30s timeout, in project dir
     if ! (cd "$PROJECT_DIR" && timeout 30 bash -c "$GATE_CHECK") >/dev/null 2>&1; then
       FAILURES="${FAILURES}  ✗ [${QUEST_NAME}] ${GATE_NAME}\n"
     fi
@@ -54,19 +53,17 @@ for quest_file in "${QUEST_FILES[@]}"; do
 done
 
 if [ -n "$FAILURES" ]; then
-  REASON=$(printf 'BLOCKED: Quest gates are failing. You cannot commit/push until ALL gates pass.\n\nFailing gates:\n%bFix these issues and retry. Run /quest check for details.' "$FAILURES")
+  REASON=$(printf 'BLOCKED: Quest gates are failing. You cannot push until ALL gates pass.\n\nFailing gates:\n%bFix these issues and retry.' "$FAILURES")
   REASON_JSON=$(echo "$REASON" | jq -Rs '.')
   echo "{\"decision\":\"block\",\"reason\":${REASON_JSON}}"
 else
   # All gates pass — auto-archive completed quests
-  if echo "$COMMAND" | grep -qE 'git\s+commit'; then
-    mkdir -p "$QUEST_DIR/done"
-    echo 'done/' > "$QUEST_DIR/.gitignore" 2>/dev/null || true
-    for quest_file in "${QUEST_FILES[@]}"; do
-      [ -f "$quest_file" ] || continue
-      mv "$quest_file" "$QUEST_DIR/done/"
-    done
-    rm -f "$QUEST_DIR/.plan-pending"
-  fi
+  mkdir -p "$QUEST_DIR/done"
+  echo 'done/' > "$QUEST_DIR/.gitignore" 2>/dev/null || true
+  for quest_file in "${QUEST_FILES[@]}"; do
+    [ -f "$quest_file" ] || continue
+    mv "$quest_file" "$QUEST_DIR/done/"
+  done
+  rm -f "$QUEST_DIR/.plan-pending"
   echo '{"decision":"allow"}'
 fi
