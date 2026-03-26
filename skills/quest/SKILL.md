@@ -1,196 +1,119 @@
 ---
 name: quest
-description: Create and manage quests — mechanically enforced task gates. Use when starting any task that modifies code, to guarantee completion. Subcommands - create, check, list, done, abandon.
+description: Create and manage quests — mechanically enforced task gates that block push and subagent return until all gates pass. Subcommands - create, check, list, done.
 user_invocable: true
 ---
 
 # Quests
 
-Quests are mechanically enforced task contracts. Each quest defines **gates** that hooks verify. Hooks block `git commit`, `git push`, and `stop` until every gate passes. Quests auto-archive on commit. Quest files are immutable once created.
+Quests are mechanically enforced task contracts. Each quest defines **gates** — shell commands that must exit 0. Hooks block `git push` and subagent return until every gate passes. Quests auto-archive on push. Quest files are immutable once created.
 
-## CRITICAL: How to write gates
+Quest files live at `.claude/quests/<name>.json` in the project directory.
 
-Every gate `check` field MUST be a call to `check-ast`. This is the ONLY allowed gate format:
+## CRITICAL: Gate philosophy
 
-```
-${CLAUDE_PLUGIN_ROOT}/bin/check-ast <file> '<tree-sitter-query>' [--min N] [--max N] [--exact N] [--zero]
-```
+### Behavioral gates are primary
 
-The harness will REJECT any gate that does not contain `check-ast`. The following are ALL FORBIDDEN and will be blocked:
-- `grep` — matches text, not code. A comment fools it.
-- `test` / `[` — shell conditionals on text output.
-- `awk` / `sed` / `rg` — text processing tools.
-- `node -e` / `python3 -c` — inline scripts.
-- `npm test` / `cargo test` / any test runner.
-- Anything that is not `check-ast`.
-
-There are ZERO exceptions. Do not try to work around this.
-
-## How to write a check-ast gate
-
-### Step 1: Run `tree-sitter parse` on the target file
-
-```bash
-tree-sitter parse path/to/file.js
-```
-
-This outputs the AST as an S-expression. Read it. Find the node types for the code you need to verify.
-
-### Step 2: Write a tree-sitter query that matches the desired structure
-
-Tree-sitter queries use S-expression pattern syntax with `@captures` and `#eq?` predicates.
-
-### Step 3: Use check-ast with that query
+The most important gates are **behavioral tests** — commands that exercise the feature and verify it works. A behavioral gate runs the code and checks the output. You cannot fake behavior.
 
 ```
-${CLAUDE_PLUGIN_ROOT}/bin/check-ast path/to/file.js '(your_query_here)' --min 1
+cd $PROJECT && cargo test test_budget_enforcement
+cd $PROJECT && npm test -- --grep "deducts cost"
+cd $PROJECT && python3 -m pytest tests/test_auth.py::test_rejects_expired_token -x
 ```
 
-Options:
-- `--min N` — at least N matches (default: 1)
-- `--max N` — at most N matches
-- `--exact N` — exactly N matches
-- `--zero` — no matches (same as `--exact 0`)
+An agent can produce a perfectly structured `evaluate_cost()` call that passes every AST check while passing `&[]` as the data. It cannot fake a test that creates a paid context, sends a message, and asserts the budget decreased.
 
-### Step 4: Test the gate before saving the quest
+### AST gates are supplementary
 
-Run the command. Verify it fails on the current code (before your changes) and would pass on the correct code. Only then save it to the quest file.
+Use `check-ast` (tree-sitter queries) to catch structural omissions — missing parameters, stale call sites, dead imports. These are the safety net, not the definition of done.
 
-## High-level checks (PREFERRED)
+### More gates are better
 
-Use `--check` mode. It generates the right tree-sitter queries automatically. Supports JS/TS, Python, Rust.
+A quest with 15 gates is better than one with 5. Each gate is cheap to run. Layer behavioral tests, structural checks, and metagates together.
 
-### fn-params — verify function signature with optional defaults
+### Do not show gate details to implementing agents
 
-```
-${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE --check fn-params $FN_NAME param1 param2="defaultValue" param3
-```
+If you are an orchestrator dispatching work to subagents: give the subagent the **spec**, not the gates. The spec describes what to build. The gates silently verify it was built. Showing the agent the exact AST patterns is teaching to the test — they will satisfy the pattern without implementing the behavior.
 
-Verifies each parameter exists in the function signature, in order. For defaults, checks the value matches.
+## Gate types
 
-### call-min-args — all calls have at least N arguments
+### 1. Behavioral gates (PRIMARY)
 
-```
-${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE --check call-min-args $FN_NAME $N
-```
+Shell commands that run tests or exercise the code. These are the gates that matter most.
 
-Counts total calls vs calls with N+ args. Fails if any call has fewer.
-
-### call-arg-matches — specific argument matches a regex
-
-```
-${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE --check call-arg-matches $FN_NAME $ARG_POS $REGEX
+```json
+{
+  "name": "budget enforcement works",
+  "check": "cd /path/to/project && cargo test test_budget_blocks_when_exceeded -- --nocapture"
+}
 ```
 
-Verifies EVERY call to the function has an argument at position N matching the regex. Fails if any call is missing it or doesn't match.
-
-### symbol-used — declared AND referenced (not dead code)
-
-```
-${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE --check symbol-used $NAME
-```
-
-Verifies the identifier appears at least twice in the AST — once for declaration, once for use. Catches "imported but never called" cheats.
-
-### import-used — imported AND actually referenced
-
-```
-${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE --check import-used $NAME
+```json
+{
+  "name": "API returns 401 for expired tokens",
+  "check": "cd /path/to/project && npm test -- --grep 'expired token' --exit"
+}
 ```
 
-Verifies the symbol appears in an import statement AND is referenced elsewhere in the code.
-
-### assigned — variable assigned from matching expression
-
-```
-${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE --check assigned $VAR_NAME $VALUE_REGEX
-```
-
-Verifies the variable is assigned from an expression matching the regex. Catches "declared but assigned to wrong thing".
-
-## Compound checks (--all)
-
-Use `--all` to require multiple queries to ALL pass. Separate queries with `--`.
-
-```
-${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE --all '<query1>' --min 1 -- '<query2>' --zero
+```json
+{
+  "name": "script runs without error",
+  "check": "cd /path/to/project && python3 -c 'from auth import validate_token; assert validate_token(\"expired\") == False'"
+}
 ```
 
-Example: function exists AND all calls have 2+ args:
+### 2. Structural gates (SUPPLEMENTARY)
 
-```
-${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE --all \
-  '(function_declaration name:(identifier) @fn (#eq? @fn "greet"))' --min 1 \
-  -- \
-  '(call_expression function:(identifier) @fn arguments:(arguments (_) (_)) (#eq? @fn "greet"))' --min 2
-```
+Tree-sitter AST queries via `check-ast`. Catch structural omissions. Use the `--check` high-level commands or raw queries.
 
-## Raw queries (for edge cases)
-
-When high-level checks don't cover your case, use a raw tree-sitter query:
-
-```
-${CLAUDE_PLUGIN_ROOT}/bin/check-ast $FILE '<tree-sitter-query>' [--min N] [--max N] [--exact N] [--zero]
+```json
+{
+  "name": "evaluate_cost has budget param",
+  "check": "${CLAUDE_PLUGIN_ROOT}/bin/check-ast /path/file.rs --check fn-params evaluate_cost rules events context"
+}
 ```
 
-To discover the query structure, run `tree-sitter parse <file>` first.
-
-## Writing good gates — more is better
-
-**Overshoot on gates.** A quest with 10 tight gates is better than one with 3 loose ones. Each gate is cheap to run but expensive to cheat. When in doubt, add another gate.
-
-Gates should verify MEANING, not just PRESENCE:
-
-1. **Signature + defaults**: `--check fn-params greet name language="en"` not just "language exists"
-2. **All call sites updated**: `--check call-min-args greet 2` not just "greet is called"
-3. **Correct argument values**: `--check call-arg-matches greet 2 "es|fr|en"` not just "has 2 args"
-4. **Imports actually used**: `--check import-used log` not just "log is imported"
-5. **Assignments correct**: `--check assigned result greet` not just "result exists"
-6. **Old patterns gone**: raw query with `--zero` for removed identifiers
-7. **Compound relationships**: `--all` to enforce multiple properties together
-
-### Tests as gates
-
-Every quest that modifies code should include a gate verifying tests were added or updated. Use `check-ast` to verify the test FILE has the right structure:
-
-```
-${CLAUDE_PLUGIN_ROOT}/bin/check-ast $TEST_FILE --check symbol-used test_greet_language
+```json
+{
+  "name": "all call sites pass 3 args",
+  "check": "${CLAUDE_PLUGIN_ROOT}/bin/check-ast /path/file.rs --check call-min-args evaluate_cost 3"
+}
 ```
 
-This verifies a test function `test_greet_language` exists AND is referenced (not dead code). Do this for each test case you expect.
+High-level `--check` commands: `fn-params`, `call-min-args`, `call-arg-matches`, `symbol-used`, `import-used`, `assigned`. See `check-ast --help` or run `${CLAUDE_PLUGIN_ROOT}/bin/check-ast` with no args for usage.
 
-### Metagates — test verification, IN ADDITION to implementation gates
+Compound: `--all '<q1>' --min N -- '<q2>' --zero` requires all queries pass.
 
-Metagates verify tests exist and are well-structured. They are ALWAYS added alongside exhaustive implementation gates, never instead of them.
+Raw: `${CLAUDE_PLUGIN_ROOT}/bin/check-ast <file> '<tree-sitter-query>' [--min N|--zero]`. Run `tree-sitter parse <file>` to discover node types.
 
-All code is AST. There is no implementation "too complex" to gate structurally. A multi-file refactor is just N files with N sets of AST checks. An algorithm change is function signatures, call sites, assignments, and control flow — all queryable. Do not skip implementation gates because something feels complicated. Break it down, gate each piece.
+### 3. Metagates (ADDITIVE)
 
-Metagates add a second layer on top:
-
-- **Test file exists**: raw query on the test file for test function definitions
-- **Test covers the change**: `--check symbol-used` on expected test function names
-- **Test assertions present**: raw query for assertion nodes
-- **Minimum test count**: raw query with `--min N`
-- **Success and failure paths**: compound query for both happy and error test cases
-
-Example metagate set:
+Verify tests were written. Always added alongside behavioral and structural gates, never instead of.
 
 ```json
 {
   "name": "test file has 3+ test functions",
-  "check": "${CLAUDE_PLUGIN_ROOT}/bin/check-ast /path/test_auth.py '(function_definition name: (identifier) @fn (#match? @fn \"test_\"))' --min 3"
-},
-{
-  "name": "tests include assertions",
-  "check": "${CLAUDE_PLUGIN_ROOT}/bin/check-ast /path/test_auth.py '(call function: (attribute object: (_) attribute: (identifier) @m) (#match? @m \"assert|assertEqual|assertTrue\"))' --min 3"
-},
-{
-  "name": "tests cover success and failure paths",
-  "check": "${CLAUDE_PLUGIN_ROOT}/bin/check-ast /path/test_auth.py --all '(function_definition name: (identifier) @fn (#match? @fn \"test_.*success|test_.*valid\"))' --min 1 -- '(function_definition name: (identifier) @fn (#match? @fn \"test_.*fail|test_.*invalid|test_.*error\"))' --min 1"
+  "check": "${CLAUDE_PLUGIN_ROOT}/bin/check-ast /path/test_file.py '(function_definition name: (identifier) @fn (#match? @fn \"test_\"))' --min 3"
 }
 ```
 
-These metagates sit next to the implementation gates, not in place of them. A quest should have BOTH.
+```json
+{
+  "name": "tests cover success and failure paths",
+  "check": "${CLAUDE_PLUGIN_ROOT}/bin/check-ast /path/test_file.py --all '(function_definition name: (identifier) @fn (#match? @fn \"test_.*success|test_.*valid\"))' --min 1 -- '(function_definition name: (identifier) @fn (#match? @fn \"test_.*fail|test_.*invalid|test_.*error\"))' --min 1"
+}
+```
+
+## Writing a quest
+
+A good quest layers all three gate types:
+
+1. **Behavioral**: test commands that exercise the feature end-to-end
+2. **Structural**: AST checks that the code has the right shape (params, call sites, imports)
+3. **Meta**: AST checks that tests exist and cover the right cases
+
+All code is AST. There is no implementation too complex to gate structurally. But structure alone is not sufficient — behavior is what matters.
 
 ## Subcommands
 
@@ -201,10 +124,11 @@ List active quests, run gates, show pass/fail.
 ### `/quest create`
 
 1. Ask the user what the task is (or infer from context)
-2. Run `tree-sitter parse` on the target files to see AST structure
-3. Write gates using `check-ast` and the templates above
-4. Present quest for user approval
-5. Write to `.claude/quests/<name>.json`
+2. Design behavioral gates first — what tests prove the feature works?
+3. Add structural gates — what AST properties must hold?
+4. Add metagates — what tests must exist?
+5. Present quest for user approval
+6. Write to `.claude/quests/<name>.json`
 
 ### `/quest check`
 
@@ -222,38 +146,6 @@ You cannot delete quest files. Only the user can. If gates are wrong or the task
 ! rm .claude/quests/<name>.json
 ```
 
-The `!` prefix runs the command in the user's shell, outside of hooks.
-
-## Complete example
-
-Task: "Add a `language` parameter to `greet()` in `app.js`, default `"en"`, update both call sites"
-
-```json
-{
-  "name": "add-language-param",
-  "description": "Add language param to greet(), update both call sites",
-  "created": "2026-03-25T00:00:00Z",
-  "gates": [
-    {
-      "name": "greet() has name and language param with default en",
-      "check": "${CLAUDE_PLUGIN_ROOT}/bin/check-ast /absolute/path/app.js --check fn-params greet name language=\"en\""
-    },
-    {
-      "name": "all calls pass at least 2 arguments",
-      "check": "${CLAUDE_PLUGIN_ROOT}/bin/check-ast /absolute/path/app.js --check call-min-args greet 2"
-    },
-    {
-      "name": "second arg is a valid language code",
-      "check": "${CLAUDE_PLUGIN_ROOT}/bin/check-ast /absolute/path/app.js --check call-arg-matches greet 2 \"en|es|fr\""
-    },
-    {
-      "name": "greet is actually called (not just declared)",
-      "check": "${CLAUDE_PLUGIN_ROOT}/bin/check-ast /absolute/path/app.js --check symbol-used greet"
-    }
-  ]
-}
-```
-
 ## Quest file format
 
 ```json
@@ -264,7 +156,7 @@ Task: "Add a `language` parameter to `greet()` in `app.js`, default `"en"`, upda
   "gates": [
     {
       "name": "human-readable gate description",
-      "check": "${CLAUDE_PLUGIN_ROOT}/bin/check-ast <file> '<tree-sitter-query>' [options]"
+      "check": "shell command that exits 0 on success"
     }
   ]
 }
@@ -272,10 +164,54 @@ Task: "Add a `language` parameter to `greet()` in `app.js`, default `"en"`, upda
 
 Quest files are immutable after creation. Only the user can delete them.
 
+## Complete example
+
+Task: "Add budget enforcement to message sending — block messages when cost exceeds budget"
+
+```json
+{
+  "name": "budget-enforcement",
+  "description": "Block message sending when cost exceeds budget",
+  "created": "2026-03-26T00:00:00Z",
+  "gates": [
+    {
+      "name": "test: message blocked when budget exceeded",
+      "check": "cd /path/project && cargo test test_message_blocked_when_budget_exceeded"
+    },
+    {
+      "name": "test: message allowed when budget available",
+      "check": "cd /path/project && cargo test test_message_sent_when_budget_available"
+    },
+    {
+      "name": "test: budget decremented after send",
+      "check": "cd /path/project && cargo test test_budget_decremented_after_send"
+    },
+    {
+      "name": "evaluate_cost has correct params",
+      "check": "${CLAUDE_PLUGIN_ROOT}/bin/check-ast /path/handler.rs --check fn-params evaluate_cost rules events context"
+    },
+    {
+      "name": "evaluate_cost is called in send_message",
+      "check": "${CLAUDE_PLUGIN_ROOT}/bin/check-ast /path/handler.rs --check symbol-used evaluate_cost"
+    },
+    {
+      "name": "budget field exists on context struct",
+      "check": "${CLAUDE_PLUGIN_ROOT}/bin/check-ast /path/types.rs '(field_declaration name: (field_identifier) @f (#eq? @f \"budget\"))'"
+    },
+    {
+      "name": "test file has 3+ test functions",
+      "check": "${CLAUDE_PLUGIN_ROOT}/bin/check-ast /path/tests.rs '(function_item name: (identifier) @fn (#match? @fn \"test_\"))' --min 3"
+    }
+  ]
+}
+```
+
+Behavioral gates first (3 tests), structural gates second (3 AST checks), metagate last (test count).
+
 ## Lifecycle
 
 1. Plan approved → hook fires → marker set
-2. Gates defined with `check-ast` → marker cleared → edits unblocked
+2. Gates defined → marker cleared → edits unblocked
 3. Work proceeds, commits are free
 4. `git push` → all gates verified → auto-archived to `.claude/quests/done/`
 5. Subagent return → gates verified → blocked if failing
